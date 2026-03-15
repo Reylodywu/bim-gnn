@@ -980,7 +980,7 @@ class Processor:
 
         return dist_matrix
 
-    def calculate_specific_weight(self, node1, node2, fire_source_id):
+    def calculate_specific_weight_origin(self, node1, node2, fire_source_id):
         """
         计算直接相连节点间的传播权重，考虑六个影响因素并记录每个阶段的权重变化：
         1. 基础权重
@@ -1167,19 +1167,228 @@ class Processor:
             self.weight_changes = {}
         self.weight_changes[edge] = weight_changes
 
-        # print(f"\nFinal calculation:")
-        # print(f"Base weight: {base_weight:.2f}")
-        # print(f"Final weight modifier: {weight_modifier:.2f}")
-        # print(f"Final weight: {current_weight:.2f}")
-
-        # edge = (node1, node2)
-        # weight_history = self.get_weight_changes().get(edge, [])
-        # stages = ['Base', 'Volume Ratio', 'Volume Size', 'Window', 'Furniture', 'External Door']
-        # for stage, weight in zip(stages, weight_history):
-        #     print(f"{stage}: {weight:.3f}")
-
         return base_weight,current_weight
 
+    def calculate_specific_weight(self, node1, node2, fire_source_id):
+        """
+        基于物理感知机制计算传播权重 (Final Optimized Version)
+
+        物理逻辑修正：
+        1. Volume Factor: 仅在填充空间(Target=Space)时激活。Door->Space阻力>1 (突扩)，Space->Door阻力=1 (瓶颈主导)。
+        2. Ventilation Factor: 区分流体力学状态。直管(D->D) > 突扩(D->S) > 突缩(S->D)。
+        3. Capacity Factor: 燃料主导逻辑 (Fuel-Controlled)，燃料越多阻力越小。
+        4. Environmental Factor: 随火源距离衰减。
+        """
+        node1_idx = self.node_to_idx[node1]
+        node2_idx = self.node_to_idx[node2]
+        fire_idx = self.node_to_idx[fire_source_id]
+
+        if self.adj_matrix[node1_idx, node2_idx] == 0:
+            return float('inf'), float('inf')
+
+        d_ij = self.dist_matrix[node1_idx, node2_idx]
+        data_i, data_j = self.G.nodes[node1], self.G.nodes[node2]
+        type1, type2 = data_i['type'], data_j['type']
+
+        # 参数定义
+        ALPHA = 0.5  # 体积敏感度
+        BETA = 1.5  # 通风敏感度
+        GAMMA = 0.8  # 燃料敏感度
+        DELTA = 0.3  # 环境影响幅度
+        LAMBDA = 20.0  # 距离衰减特征长度
+
+        # --- 1. Volume Factor (容量/突扩阻力) ---
+        # 逻辑：只有"进入并填满"一个大空间时，体积才构成阻力
+        if type2 == 'space':
+            vol_j = max(data_j.get('volume', 10.0), 10.0)
+            if type1 == 'door':
+                # Door->Space: 突扩效应 + 填充时间。门效体积设为10，计算倍率。
+                # 限制最大倍率为6倍，防止大厅阻力过大。
+                ratio = min(vol_j / 10.0, 6.0)
+                phi_vol = ratio ** ALPHA
+            elif type1 == 'space':
+                # Space->Space: 标准体积热容比
+                vol_i = max(data_i.get('volume', 10.0), 0.1)
+                phi_vol = (vol_j / vol_i) ** ALPHA
+            else:
+                phi_vol = 1.0
+        else:
+            # Target is Door/Stair: 体积不构成阻力 (Space->Door 由瓶颈主导)
+            phi_vol = 1.0
+
+        # --- 2. Ventilation Factor (气动/接口阻力) ---
+        # 逻辑：描述接口的几何通畅度和流体动能损失
+        if type1 == 'door' and type2 == 'door':
+            opening_ratio = 0.95  # 管流：极度通畅
+        elif type1 == 'door' and type2 == 'space':
+            opening_ratio = 0.75  # 突扩：有湍流损失
+        elif type1 == 'space' and type2 == 'door':
+            opening_ratio = 0.50  # 突缩：瓶颈限制 (几何约束最强)
+        elif type1 == 'stair' and type2 == 'stair':
+            opening_ratio = 1.0  # 烟囱效应：垂直贯通
+        else:
+            opening_ratio = 0.1  # 普通隔墙
+
+        phi_vent = np.exp(-BETA * opening_ratio)
+
+        # --- 3. Capacity Factor (燃料荷载) ---
+        # 逻辑：燃料密度越高 -> 火势越猛 -> 阻力越小
+        if type2 == 'space':
+            rho = data_j.get('furniture_volume', 0) / max(data_j.get('volume', 1.0), 1.0)
+            phi_cap = 1.0 / (1.0 + GAMMA * rho)
+        else:
+            phi_cap = 1.0
+
+        # --- 4. Environmental Factor (距离衰减) ---
+        # 逻辑：外窗/门的影响随火源距离指数衰减
+        has_ext = data_j.get('is_external', False) or data_j.get('window_state', False)
+        dist_fire = self.dist_matrix[node2_idx, fire_idx]
+
+        decay = 0.0 if dist_fire == float('inf') else np.exp(-dist_fire / LAMBDA)
+        phi_env = 1 - (DELTA * (1.0 if has_ext else 0.0) * decay)
+
+        # --- Final Calculation ---
+        total_modifier = phi_vol * phi_vent * phi_cap * phi_env
+        final_weight = d_ij * total_modifier
+
+        return d_ij, final_weight
+
+    def visualize_weight_impact(self, save_path=None):
+        """
+        可视化：对比 Base Weight (几何距离) 与 Final Weight (物理修正) 的差异
+        """
+        print("开始生成权重影响分析图...")
+
+        # 确保矩阵已加载
+        if not hasattr(self, 'final_adj_matrix') or not hasattr(self, 'original_adj_matrix'):
+            print("错误：矩阵尚未生成，请先运行 build_final_adjacency_matrix()")
+            return
+
+        n = len(self.G.nodes())
+        ratios = []  # 存储比率: Final / Original
+        edges_info = []  # 存储边的数据用于绘图
+
+        # 收集数据
+        for i in range(n):
+            for j in range(n):
+                # 只看有效连接，且忽略对角线
+                if i != j and self.original_adj_matrix[i][j] > 0:
+                    w_base = self.original_adj_matrix[i][j]
+                    w_final = self.final_adj_matrix[i][j]
+
+                    # 避免除以0
+                    if w_base == 0: continue
+
+                    ratio = w_final / w_base
+                    ratios.append(ratio)
+
+                    edges_info.append({
+                        'u': self.idx_to_node[i],
+                        'v': self.idx_to_node[j],
+                        'ratio': ratio
+                    })
+
+        if not ratios:
+            print("警告：未找到有效边数据进行可视化。")
+            return
+
+        ratios = np.array(ratios)
+
+        # --- 创建画布 ---
+        fig = plt.figure(figsize=(18, 8), constrained_layout=True)
+        gs = fig.add_gridspec(1, 2, width_ratios=[1, 1.5])
+
+        # --- 图 1: 权重变化分布直方图 ---
+        ax_hist = fig.add_subplot(gs[0])
+        ax_hist.axvline(1.0, color='black', linestyle='--', linewidth=2, label='No Change')
+        sns.histplot(ratios, bins=30, kde=True, ax=ax_hist, color='skyblue', edgecolor='black')
+        mean_ratio = np.mean(ratios)
+        ax_hist.axvline(mean_ratio, color='red', linestyle=':', linewidth=2, label=f'Mean: {mean_ratio:.2f}x')
+
+        ax_hist.set_title('Distribution of Weight Modification Factors ($\phi_{total}$)', fontsize=14)
+        ax_hist.set_xlabel('Ratio (Final / Base)', fontsize=12)
+        ax_hist.legend()
+
+        # --- 图 2: 空间网络热力图 ---
+        ax_net = fig.add_subplot(gs[1])
+
+        # 获取节点位置
+        pos = {}
+        # 尝试从 G.nodes 属性中获取 'pos' (x,y,z) 并转为 (x,y)
+        # 如果你的节点是 (x,y,z) 元组作为ID，也可以直接用
+        for node in self.G.nodes():
+            # 方案A: 节点ID本身就是坐标 (x,y,z) -> 这种最方便
+            if isinstance(node, tuple) and len(node) >= 2:
+                pos[node] = (node[0], node[1])
+            # 方案B: 节点属性中有 'pos'
+            elif 'pos' in self.G.nodes[node]:
+                p = self.G.nodes[node]['pos']
+                pos[node] = (p[0], p[1])
+            else:
+                # 方案C: 弹簧布局兜底
+                if not pos:  # 只计算一次
+                    pos = nx.spring_layout(self.G, seed=42)
+                if node not in pos:  # 防止有的节点没位置
+                    pos[node] = (0, 0)
+
+        # 1. 绘制普通节点
+        nx.draw_networkx_nodes(self.G, pos, node_size=20, node_color='lightgray', alpha=0.6, ax=ax_net)
+
+        # 2. 绘制火源节点 (修复部分：移除 marker 参数，改用 node_shape)
+        fire_node = self.idx_to_node[self.fire_index]
+        if fire_node in pos:
+            nx.draw_networkx_nodes(
+                self.G, pos,
+                nodelist=[fire_node],
+                node_size=200,  # 把火源画大一点
+                node_color='red',
+                node_shape='*',  # 这里使用 node_shape 来指定五角星
+                label='Fire Source',
+                ax=ax_net
+            )
+
+        # 3. 绘制边 (根据 Ratio 上色)
+        edge_colors = [d['ratio'] for d in edges_info]
+        edge_list = [(d['u'], d['v']) for d in edges_info]
+
+        if edge_list:
+            # 定义颜色映射和范围
+            cmap = plt.cm.RdYlBu
+            vmin = 0.5
+            vmax = 1.5
+
+            # 绘制边 (注意：我们不再依赖它的返回值来做 colorbar)
+            nx.draw_networkx_edges(
+                self.G, pos,
+                edgelist=edge_list,
+                edge_color=edge_colors,
+                edge_cmap=cmap,
+                edge_vmin=vmin,
+                edge_vmax=vmax,
+                width=1.5,
+                alpha=0.8,
+                ax=ax_net,
+                arrows=True
+            )
+
+            # --- 修复部分：手动创建 ScalarMappable 用于 Colorbar ---
+            # 这是一个虚拟对象，专门告诉 colorbar 颜色范围和色卡是什么
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=vmin, vmax=vmax))
+            sm.set_array([])  # 必须设置一个空数组，否则 matplotlib 会报错
+
+            # 使用 sm 来生成 colorbar
+            cbar = plt.colorbar(sm, ax=ax_net, fraction=0.046, pad=0.04)
+            cbar.set_label('Physics Modifier Factor ($\phi$)\nRed=Faster Spread, Blue=Slower Spread', rotation=270,
+                           labelpad=20)
+
+        ax_net.set_title(f'Spatial Weight Impact (Fire Node: {self.fire_index})', fontsize=14)
+        ax_net.axis('off')
+
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"图表已保存至: {save_path}")
+        else:
+            plt.show()
     def get_weight_changes(self):
         """
         返回所有边的权重变化记录
@@ -1191,11 +1400,14 @@ class Processor:
         return {}
 
     def build_final_adjacency_matrix(self):
-        """构建考虑火灾蔓延因素后的最终邻接矩阵"""
+        """构建考虑火灾蔓延因素后的最终邻接矩阵，并保存 Original 和 Final 两个版本（均包含楼梯修正）"""
         self.build_adjacency_matrix()
         fire_source_node = self.idx_to_node[self.fire_index]
         n = len(self.G.nodes())
+
+        # 初始化两个矩阵
         final_adj_matrix = np.zeros((n, n))
+        original_adj_matrix = np.zeros((n, n))
 
         for i in range(n):
             for j in range(n):
@@ -1208,29 +1420,82 @@ class Processor:
                         is_stair_connection = (self.G.nodes[node1].get('type') == 'stair' and
                                                self.G.nodes[node2].get('type') == 'stair')
 
-                        base_weight,weight = self.calculate_specific_weight(node1, node2, fire_source_node)
+                        # 获取基础权重(base_weight)和受火灾影响权重(weight)
+                        base_weight, weight = self.calculate_specific_weight(node1, node2, fire_source_node)
 
+                        # 使用临时变量存储即将赋值的权重
+                        val_original = base_weight
+                        val_final = weight
+
+                        # --- 统一应用楼梯修正 ---
                         if is_stair_connection:
-                            # 楼梯连接权重修正
                             stair_factor = self.calculate_stair_factor(node1, node2, fire_source_node)
-                            weight *= stair_factor
+                            # Original 和 Final 都乘上楼梯修正系数
+                            val_original *= stair_factor
+                            val_final *= stair_factor
 
-                        final_adj_matrix[i][j] = weight
+                        # 赋值到对应矩阵
+                        original_adj_matrix[i][j] = val_original
+                        final_adj_matrix[i][j] = val_final
                     else:
                         final_adj_matrix[i][j] = 0
+                        original_adj_matrix[i][j] = 0
 
+        # 填充对角线
         np.fill_diagonal(final_adj_matrix, 1)
+        np.fill_diagonal(original_adj_matrix, 1)
+
+        self.original_adj_matrix = original_adj_matrix
         self.final_adj_matrix = final_adj_matrix
 
-        # 保存矩阵
+        # --- 保存矩阵 ---
         save_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path = os.path.join(save_dir, f'adj_final{self.fire_index}.npz')
-        sp.save_npz(save_path, sp.csc_matrix(self.final_adj_matrix))
 
-        # 同时保存边列表格式
+        # 1. 保存 Final 版本 (weight * stair_factor)
+        save_path_final = os.path.join(save_dir, f'adj_final{self.fire_index}.npz')
+        sp.save_npz(save_path_final, sp.csc_matrix(final_adj_matrix))
+
+        # 2. 保存 Original 版本 (base_weight * stair_factor)
+        save_path_original = os.path.join(save_dir, f'adj_original{self.fire_index}.npz')
+        sp.save_npz(save_path_original, sp.csc_matrix(original_adj_matrix))
+
+        # 同时也保存边列表格式
         self.matrix_to_edge_list()
 
         return final_adj_matrix
+
+    def apply_gaussian_threshold(self):
+        """对矩阵应用高斯核和阈值处理 (保存 Final 和 Original 两个版本)"""
+        save_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # 定义要处理的目标：(名称标识, 对应的矩阵数据)
+        targets = [
+            ('final', self.final_adj_matrix),
+            ('original', self.original_adj_matrix)
+        ]
+
+        for name, matrix in targets:
+            n = matrix.shape[0]
+            result = np.zeros((n, n))
+
+            # 应用高斯核
+            for i in range(n):
+                for j in range(n):
+                    if i != j and matrix[i][j] > 0:
+                        result[i][j] = np.exp(-matrix[i][j] ** 2 / 20)
+
+            # 保持对角线为1
+            np.fill_diagonal(result, 1.0)
+
+            # 保存文件：分别保存为 adj_gaussian_final_... 和 adj_gaussian_original_...
+            save_path = os.path.join(save_dir, f'adj_gaussian_{name}_{self.fire_index}.npz')
+            sp.save_npz(save_path, sp.csc_matrix(result))
+
+            # 更新类属性 (self.gaussian_matrix 默认指向 final 以保持后续代码兼容)
+            if name == 'final':
+                self.gaussian_matrix = result
+
+        return self.gaussian_matrix
 
     def matrix_to_edge_list(self):
         """
@@ -1289,28 +1554,6 @@ class Processor:
 
         return base_factor
 
-    def apply_gaussian_threshold(self):
-        """对矩阵应用高斯核和阈值处理"""
-        matrix = self.final_adj_matrix
-        n = matrix.shape[0]
-        result = np.zeros((n, n))
-
-        # 应用高斯核
-        for i in range(n):
-            for j in range(n):
-                if i != j and matrix[i][j] > 0:
-                    result[i][j] = np.exp(-matrix[i][j] ** 2 / 20)
-
-        # 保持对角线为1
-        np.fill_diagonal(result, 1.0)
-        self.gaussian_matrix = result
-
-        # 保存为sparse矩阵
-        save_dir = os.path.dirname(os.path.abspath(__file__))
-        save_path = os.path.join(save_dir, f'adj_gaussian_{self.fire_index}.npz')
-        sp.save_npz(save_path, sp.csc_matrix(result))
-
-        return result
 
     def _base_visualize_network(self, graph, weights_dict, title):
         fig = plt.figure(figsize=(12, 8))
