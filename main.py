@@ -76,6 +76,10 @@ def get_parameters():
     parser.add_argument('--gamma', type=float, default=0.95)
     parser.add_argument('--patience', type=int, default=100, help='early stopping patience')
     parser.add_argument('--model_type', type=str, default='improved',choices=['origin','improved'])
+
+    parser.add_argument('--noise_std', type=float, default=0.0,
+                        help='测试集高斯噪声标准差 (例如 1.0 代表 1度/1ppm 的标准差)')
+    parser.add_argument('--sparsity_rate', type=float, default=0.0, help='测试集数据缺失率 (0.0 到 1.0)')
     args = parser.parse_args()
     print('Training configs: {}'.format(args))
 
@@ -111,6 +115,34 @@ def get_parameters():
 
     return args, device, blocks
 
+# 数据扰动
+def apply_perturbation(data, noise_std=0.0, sparsity_rate=0.0):
+    """
+    向真实数据中注入传感器噪声和数据稀疏性
+    :param data: 原始 numpy 数组
+    :param noise_std: 高斯噪声标准差（模拟传感器测量误差，如温度漂移）
+    :param sparsity_rate: 数据丢失率 0~1 之间（模拟传感器故障或通信丢包）
+    :return: 扰动后的数据
+    """
+    perturbed_data = data.copy()
+
+    # 1. 添加传感器噪声 (高斯噪声)
+    if noise_std > 0:
+        # 生成与数据同形状的高斯噪声
+        noise = np.random.normal(loc=0.0, scale=noise_std, size=perturbed_data.shape)
+        perturbed_data += noise
+
+    # 2. 添加数据稀疏性 (随机丢包)
+    if sparsity_rate > 0:
+        # 生成掩码 (True表示保留，False表示丢失)
+        mask = np.random.rand(*perturbed_data.shape) > sparsity_rate
+
+        # 对于时间序列的丢失，简单的做法是将其置为前一时刻的值（前向填充），
+        # 这里用 pandas 快速实现前向填充，更符合真实传感器的"信号保持"特性
+        df = pd.DataFrame(np.where(mask, perturbed_data, np.nan))
+        perturbed_data = df.fillna(method='ffill').fillna(0).values  # 如果第一行也是nan则补0
+
+    return perturbed_data
 
 # 数据准备
 def data_preparate(args, device):
@@ -134,7 +166,10 @@ def data_preparate(args, device):
 
     # 获取原始数据
     train, val, test, vel_all = dataloader.load_data(args.dataset, args.target_type, len_train, len_val)
-
+    if args.noise_std > 0 or args.sparsity_rate > 0:
+        print(f"注意: 正在进行鲁棒性测试! Noise STD: {args.noise_std}, Sparsity: {args.sparsity_rate}")
+        train = apply_perturbation(train, noise_std=args.noise_std, sparsity_rate=args.sparsity_rate)
+        # test = apply_perturbation(test, noise_std=args.noise_std, sparsity_rate=args.sparsity_rate)
     # 保存原始数据用于迭代预测
     original_train = train.copy()
     original_val = val.copy()
@@ -153,12 +188,11 @@ def data_preparate(args, device):
     x_val, y_val = dataloader.data_transform(val, args.n_his, args.n_pred, device)
     x_test, y_test = dataloader.data_transform(test, args.n_his, args.n_pred, device)
     x_all, y_all = dataloader.data_transform(vel_all, args.n_his, args.n_pred, device)
-    print("x_test.shape:", x_test.shape, "y_test.shape:", y_test.shape)
+    # print("x_test.shape:", x_test.shape, "y_test.shape:", y_test.shape)
 
     # 创建数据迭代器
     train_data = utils.data.TensorDataset(x_train, y_train)
     train_iter = utils.data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=False)
-    print('train_iter长度:', len(train_iter))
     val_data = utils.data.TensorDataset(x_val, y_val)
     val_iter = utils.data.DataLoader(dataset=val_data, batch_size=args.batch_size, shuffle=False)
     test_data = utils.data.TensorDataset(x_test, y_test)
@@ -302,7 +336,7 @@ def _test(zscore, loss, model, test_iter, args):
 
     print(
         f'Dataset {args.dataset:s} | Test loss {test_MSE:.4f} | MAE {test_MAE:.4f} |WMAPE {test_WMAPE:.4f} | RMSE {test_RMSE:.4f} ')
-
+    return test_MAE, test_WMAPE, test_RMSE
 
 # def test_iterative_forecast_improved(args, model, device, test_data, zscore, start_pos,n_total_pred):
 #     """
@@ -1100,26 +1134,77 @@ def plot_model_comparison(results):
 #     plot_model_comparison(results)
 
 
-if __name__ == "__main__":
-    # Logging
-    # logger = logging.getLogger('stgcn')
-    # logging.basicConfig(filename='stgcn.log', level=logging.INFO)
-    logging.basicConfig(level=logging.INFO)
+# if __name__ == "__main__":
+#     # Logging
+#     # logger = logging.getLogger('stgcn')
+#     # logging.basicConfig(filename='stgcn.log', level=logging.INFO)
+#     logging.basicConfig(level=logging.INFO)
+#
+#     warnings.filterwarnings("ignore", category=FutureWarning)
+#     warnings.filterwarnings("ignore", category=UserWarning)
+#
+#     args, device, blocks = get_parameters()
+#     # 修改调用
+#     n_vertex, zscore, train_iter, val_iter, test_iter, all_iter, raw_data = data_preparate(args, device)
+#     loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, device)
+#     train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter)
+#     _test(zscore, loss, model, test_iter, args)
+#
+#     # predictions, errors = test_iterative_forecast_improved(args, model, device, raw_data['train'], zscore, start_pos=100,n_total_pred=12)
+#
+#     print("迭代预测测试完成!")
 
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     warnings.filterwarnings("ignore", category=FutureWarning)
     warnings.filterwarnings("ignore", category=UserWarning)
 
     args, device, blocks = get_parameters()
-    # 修改调用
-    n_vertex, zscore, train_iter, val_iter, test_iter, all_iter, raw_data = data_preparate(args, device)
-    loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, device)
-    # train(args, model, loss, optimizer, scheduler, es, train_iter, val_iter)
-    _test(zscore, loss, model, train_iter, args)
 
-    predictions, errors = test_iterative_forecast_improved(args, model, device, raw_data['train'], zscore, start_pos=100,n_total_pred=12)
+    # 设定测试参数
+    noise_levels = [0.0, 1.0, 2.0, 5.0]
+    sparsity_levels = [0.0, 0.1, 0.3]
 
-    print("迭代预测测试完成!")
+    # 用于存储结果的列表
+    results_summary = []
 
+    print("\n========= 开始训练集(Train) 【单步预测】 鲁棒性测试 =========")
+    for noise in noise_levels:
+        for sparsity in sparsity_levels:
+            args.noise_std = noise
+            args.sparsity_rate = sparsity
+
+            # 重新制备带扰动的数据
+            # (确保 data_preparate 中已经按上一条回答加入了对 train 注入扰动的逻辑)
+            n_vertex, zscore, train_iter, val_iter, test_iter, all_iter, raw_data = data_preparate(args, device)
+            loss, es, model, optimizer, scheduler = prepare_model(args, blocks, n_vertex, device)
+
+            print(f"\n[运行中] 测试条件: 噪声 Std={noise}, 缺失率={sparsity}")
+
+            # 评估【单步预测】误差（传入 train_iter），并接收返回的指标
+            test_MAE, test_WMAPE, test_RMSE = _test(zscore, loss, model, train_iter, args)
+
+            # 存入汇总列表
+            results_summary.append({
+                'noise': noise,
+                'sparsity': sparsity,
+                'mae': test_MAE,
+                'wmape': test_WMAPE,
+                'rmse': test_RMSE
+            })
+
+    # ================== 自动生成 Markdown 表格 ==================
+    print("\n\n" + "=" * 50)
+    print("✅ 实验完成！以下为您生成的 【单步预测】 Markdown 格式结果表格：")
+    print("=" * 50 + "\n")
+
+    print("| 噪声标准差 (Noise Std) | 丢失率 (Sparsity) | MAE | WMAPE (%) | RMSE |")
+    print("| :---: | :---: | :---: | :---: | :---: |")
+    for res in results_summary:
+        print(
+            f"| {res['noise']:.1f} | {res['sparsity']:.1f} | {res['mae']:.4f} | {res['wmape']:.4f} | {res['rmse']:.4f} |")
+
+    print("\n" + "=" * 50)
 
 
 
